@@ -1,86 +1,102 @@
 import asyncio
 import json
-from datetime import datetime, time
+from datetime import datetime, timezone, time
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message
+from aiogram.enums import ChatType
 from aiogram.filters import Command
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-TOKEN = "8501817032:AAHK4DpmF4CISTfsTJpb0MzXkeInRDA9SU8"
-DATA_FILE = Path("data.json")
+TOKEN = "PUT_YOUR_TOKEN"
 
-bot = Bot(TOKEN)
-dp = Dispatcher()
-scheduler = AsyncIOScheduler()
+DATA_FILE = Path("data.json")
 
 def load_data():
     if DATA_FILE.exists():
-        return json.loads(DATA_FILE.read_text())
+        with open(DATA_FILE, "r") as f:
+            return json.load(f)
     return {}
 
 def save_data(data):
-    DATA_FILE.write_text(json.dumps(data))
+    with open(DATA_FILE, "w") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 data = load_data()
 
-@dp.message()
-async def track(message: Message):
-    if message.chat.type not in ("group","supergroup"):
-        return
-    cid = str(message.chat.id)
-    today = datetime.utcnow().date().isoformat()
-    info = data.get(cid, {"streak": 0, "last_day": None, "active_today": False})
-    info["active_today"] = True
-    data[cid] = info
+bot = Bot(TOKEN)
+dp = Dispatcher()
+
+async def ensure_group_entry(chat_id):
+    if str(chat_id) not in data:
+        data[str(chat_id)] = {
+            "streak": 0,
+            "active_today": False,
+        }
+        save_data(data)
+
+@dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
+async def track_message(msg: Message):
+    cid = str(msg.chat.id)
+    await ensure_group_entry(cid)
+    data[cid]["active_today"] = True
+    save_data(data)
+
+async def update_streaks():
+    today = datetime.now(timezone.utc).date().isoformat()
+
+    for cid, info in data.items():
+        if info.get("active_today"):
+            info["streak"] += 1
+        else:
+            info["streak"] = 0
+
+        info["active_today"] = False
+
+        try:
+            await bot.set_chat_title(
+                int(cid),
+                f"{cid} {info['streak']}🔥"
+            )
+        except Exception:
+            pass
+
     save_data(data)
 
 @dp.message(Command("streak"))
-async def cmd_streak(message: Message):
-    cid = str(message.chat.id)
-    info = data.get(cid, {"streak":0})
-    await message.reply(f"🔥 Стрик: {info['streak']}")
+async def cmd_streak(msg: Message):
+    cid = str(msg.chat.id)
+    await ensure_group_entry(cid)
+    await msg.answer(f"Current streak: {data[cid]['streak']}🔥")
 
 @dp.message(Command("set"))
-async def cmd_set(message: Message):
-    if not message.from_user or not message.from_user.id:
-        return
-    parts = message.text.split()
-    if len(parts)!=2 or not parts[1].isdigit():
-        return await message.reply("Использование: /set 10")
-    cid=str(message.chat.id)
-    data.setdefault(cid,{"streak":0,"active_today":False,"last_day":None})
-    data[cid]["streak"]=int(parts[1])
+async def cmd_set(msg: Message):
+    cid = str(msg.chat.id)
+    await ensure_group_entry(cid)
+
+    parts = msg.text.split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        return await msg.answer("Usage: /set <number>")
+
+    data[cid]["streak"] = int(parts[1])
     save_data(data)
-    await message.reply("Установлено.")
+    await msg.answer("Streak updated.")
 
 @dp.message(Command("reset"))
-async def cmd_reset(message: Message):
-    cid=str(message.chat.id)
-    if cid in data:
-        data[cid]["streak"]=0
-        save_data(data)
-    await message.reply("Стрик сброшен.")
-
-async def daily_update():
-    now = datetime.utcnow().date().isoformat()
-    for cid, info in data.items():
-        if info.get("active_today"):
-            info["streak"] = info.get("streak",0)+1
-        else:
-            info["streak"] = 0
-        info["active_today"] = False
-        data[cid] = info
-        try:
-            await bot.set_chat_title(int(cid), f"🔥 {info['streak']}")
-        except:
-            pass
+async def cmd_reset(msg: Message):
+    cid = str(msg.chat.id)
+    await ensure_group_entry(cid)
+    data[cid]["streak"] = 0
+    data[cid]["active_today"] = False
     save_data(data)
+    await msg.answer("Streak reset.")
 
 async def main():
-    scheduler.add_job(daily_update, "cron", hour=0, minute=0)
+    scheduler = AsyncIOScheduler(timezone="UTC")
+    scheduler.add_job(update_streaks, "cron", hour=0, minute=0)
     scheduler.start()
+
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
