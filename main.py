@@ -8,7 +8,7 @@ from aiogram.types import Message
 from aiogram.filters import Command
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-TOKEN = "PUT_YOUR_TOKEN"
+TOKEN = "8501817032:AAHK4DpmF4CISTfsTJpb0MzXkeInRDA9SU8"
 DATA_FILE = Path("data.json")
 
 bot = Bot(TOKEN)
