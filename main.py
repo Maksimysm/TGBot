@@ -4,7 +4,7 @@ from aiogram import Bot, Dispatcher
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 TOKEN = os.getenv("8501817032:AAHK4DpmF4CISTfsTJpb0MzXkeInRDA9SU8")
-GROUP_ID = int(os.getenv("-1001884065247"))
+GROUP_ID = int(os.getenv("GROUP_ID"))
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
