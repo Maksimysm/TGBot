@@ -11,7 +11,7 @@ from aiogram.client.default import DefaultBotProperties
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-TOKEN = "YOUR_TOKEN"
+TOKEN = "8501817032:AAHK4DpmF4CISTfsTJpb0MzXkeInRDA9SU8"
 
 bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
