@@ -13,16 +13,16 @@ from aiogram.enums import ChatType, ChatMemberStatus
 from aiogram.filters import Command
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-# === CONFIG ===
-TOKEN = os.getenv("BOT_TOKEN", "PUT_YOUR_TOKEN")
-DATA_FILE = os.getenv("DATA_FILE", "data.json")
-TZ = os.getenv("TZ", "Europe/Kyiv")  # timezone for daily tick
+# ===== CONFIG =====
+TOKEN = os.getenv('BOT_TOKEN', 'PUT_YOUR_TOKEN_HERE')
+DATA_FILE = os.getenv('DATA_FILE', 'data.json')
+TZ = os.getenv('TZ', 'UTC')  # timezone for scheduling; default UTC
 
-if TOKEN == "PUT_YOUR_TOKEN":
-    # Friendly reminder; in prod override BOT_TOKEN env var
-    pass
+# Emoji choices per your request
+GRAY_HEART = '🩶'   # waiting state
+RED_HEART = '❤️'   # active state
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
 
 bot = Bot(token=TOKEN)
@@ -30,20 +30,19 @@ dp = Dispatcher()
 scheduler = AsyncIOScheduler(timezone=TZ)
 data_lock = asyncio.Lock()
 
-# Data structure:
+# Data schema:
 # {
 #   "<chat_id>": {
 #       "streak": int,
-#       "active_today": bool,
-#       "original_title": str or None,
-#       "last_updated": "YYYY-MM-DD" or None
-#   },
-#   ...
+#       "waiting": bool,          # True after 00:01 until first message
+#       "active_today": bool,     # True if at least one user message today
+#       "original_title": str or None
+#   }
 # }
 
 def atomic_write(path: str, content: str):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
+    tmp = path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
         f.write(content)
     os.replace(tmp, path)
 
@@ -51,10 +50,10 @@ async def load_data() -> Dict[str, Any]:
     if not os.path.exists(DATA_FILE):
         return {}
     try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
+        with open(DATA_FILE, 'r', encoding='utf-8') as f:
             return json.load(f)
     except Exception:
-        logger.exception("Failed to load data.json, starting fresh")
+        logger.exception('Failed to load data.json, starting with empty data')
         return {}
 
 async def save_data(data: Dict[str, Any]):
@@ -63,178 +62,254 @@ async def save_data(data: Dict[str, Any]):
 
 def strip_streak_suffix(title: str) -> str:
     if not title:
-        return title or ""
-    # remove trailing " <num>🔥" possibly with spaces
-    return re.sub(r"\s*\d+\s*🔥\s*$", "", title).strip()
+        return ''
+    return re.sub(r'\s*\d+\s*(?:' + re.escape(GRAY_HEART) + r'|' + re.escape(RED_HEART) + r')\s*$', '', title).strip()
 
-async def is_user_admin(chat_id: int, user_id: int) -> bool:
+async def is_admin(chat_id: int, user_id: int) -> bool:
     try:
         member = await bot.get_chat_member(chat_id, user_id)
         return member.status in (ChatMemberStatus.CREATOR, ChatMemberStatus.ADMINISTRATOR)
     except Exception:
         return False
 
-# === Handlers ===
+# ===== Helpers =====
+async def ensure_chat_entry(data: Dict[str, Any], chat_id: int) -> Dict[str, Any]:
+    cid = str(chat_id)
+    if cid not in data:
+        data[cid] = {
+            'streak': 0,
+            'waiting': False,
+            'active_today': False,
+            'original_title': None
+        }
+    return data[cid]
 
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    await message.reply(
-        "Привет! Я бот-стрик. Добавь меня в группу и дайте права администратора (Change Info).\n"
-        "Команды для админов: /streak /set <число> /reset /force_tick\n"
-        "Дополнительные команды: /debug /status /groups"
-    )
+async def set_chat_title_safe(chat_id: int, base_title: str, streak: int, heart: str):
+    if not base_title:
+        return
+    new_title = f"{base_title} {streak}{heart}" if streak > 0 else base_title
+    try:
+        await bot.set_chat_title(chat_id, new_title)
+    except Exception:
+        logger.exception('Failed to set chat title for %s', chat_id)
 
-@dp.message(Command("streak"))
+# ===== Commands (Variant A: short names) =====
+@dp.message(Command('help'))
+async def cmd_help(message: types.Message):
+    text = (
+        "Команды:\n"
+        "/streak — показать текущий стрик и состояние\n"
+        "/set <число> — (админ) установить стрик\n"
+        "/reset — (админ) обнулить стрик\n"
+        "/status — (админ) подробная информация по группе\n"
+        "/debug — (админ) показать внутренние данные для группы\n"
+        "/force_tick — (админ) принудительно выполнить 00:01 тик\n"
+        "/rename — (админ) обновить название группы по текущим данным\n"        )
+    await message.reply(text)
+
+@dp.message(Command('streak'))
 async def cmd_streak(message: types.Message):
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-        return await message.reply("Команда работает только в группах.")
+        return await message.reply('Команда доступна только в группах.')
     data = await load_data()
-    entry = data.get(str(message.chat.id), {"streak": 0})
-    await message.reply(f"Текущий стрик: {entry.get('streak', 0)}🔥")
+    entry = await ensure_chat_entry(data, message.chat.id)
+    heart = GRAY_HEART if entry.get('waiting') else (RED_HEART if entry.get('streak', 0) > 0 else '')
+    await message.reply(f"Текущий стрик: {entry.get('streak',0)}{heart}")
 
-@dp.message(Command("set"))
+@dp.message(Command('set'))
 async def cmd_set(message: types.Message):
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-        return await message.reply("Только в группах.")
-    if not await is_user_admin(message.chat.id, message.from_user.id):
-        return await message.reply("Только администраторы могут использовать эту команду.")
+        return await message.reply('Только в группах.')
+    if not await is_admin(message.chat.id, message.from_user.id):
+        return await message.reply('Только администраторы могут использовать эту команду.')
     parts = message.text.split()
     if len(parts) != 2 or not parts[1].isdigit():
-        return await message.reply("Использование: /set <число>")
+        return await message.reply('Использование: /set <число>')
     val = int(parts[1])
     data = await load_data()
-    cid = str(message.chat.id)
-    entry = data.get(cid, {})
-    entry.setdefault("original_title", None)
-    entry["streak"] = val
-    entry["active_today"] = False
-    entry["last_updated"] = datetime.now(timezone.utc).date().isoformat()
-    data[cid] = entry
-    await save_data(data)
-
-    # update title
+    entry = await ensure_chat_entry(data, message.chat.id)
+    entry['streak'] = val
+    entry['active_today'] = False
+    entry['waiting'] = False
+    # try to capture original title
     try:
         chat = await bot.get_chat(message.chat.id)
-        base = entry.get("original_title") or strip_streak_suffix(chat.title or "")
-        entry["original_title"] = base
-        new_title = f"{base} {val}🔥" if val > 0 else base
-        await bot.set_chat_title(message.chat.id, new_title)
-        await save_data(data)
+        base = strip_streak_suffix(chat.title or '')
+        entry['original_title'] = base
+        await set_chat_title_safe(message.chat.id, base, val, RED_HEART if val>0 else '')
     except Exception:
-        logger.exception("Failed to set chat title on /set")
+        logger.exception('Failed to set title on /set')
+    await save_data(data)
+    await message.reply(f'Стрик установлен: {val}')
 
-    await message.reply(f"Стрик установлен: {val}🔥")
-
-@dp.message(Command("reset"))
+@dp.message(Command('reset'))
 async def cmd_reset(message: types.Message):
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-        return await message.reply("Только в группах.")
-    if not await is_user_admin(message.chat.id, message.from_user.id):
-        return await message.reply("Только администраторы могут использовать эту команду.")
+        return await message.reply('Только в группах.')
+    if not await is_admin(message.chat.id, message.from_user.id):
+        return await message.reply('Только админам.')
     data = await load_data()
-    cid = str(message.chat.id)
-    entry = data.get(cid, {})
-    entry["streak"] = 0
-    entry["active_today"] = False
-    await save_data(data)
-
+    entry = await ensure_chat_entry(data, message.chat.id)
+    entry['streak'] = 0
+    entry['waiting'] = False
+    entry['active_today'] = False
     # restore title
     try:
         chat = await bot.get_chat(message.chat.id)
-        base = entry.get("original_title") or strip_streak_suffix(chat.title or "")
-        await bot.set_chat_title(message.chat.id, base)
-        entry["original_title"] = base
-        await save_data(data)
+        base = entry.get('original_title') or strip_streak_suffix(chat.title or '')
+        entry['original_title'] = base
+        await set_chat_title_safe(message.chat.id, base, 0, '')
     except Exception:
-        logger.exception("Failed to restore title on /reset")
-    await message.reply("Стрик обнулён.")
+        logger.exception('Failed to restore title on /reset')
+    await save_data(data)
+    await message.reply('Стрик обнулён.')
 
-@dp.message(Command("debug"))
-async def cmd_debug(message: types.Message):
-    # admin-only
-    if not await is_user_admin(message.chat.id, message.from_user.id):
-        return await message.reply("Только админам.")
-    data = await load_data()
-    await message.reply(f"DATA: {json.dumps(data.get(str(message.chat.id), {}), ensure_ascii=False, indent=2)}")
-
-@dp.message(Command("force_tick"))
-async def cmd_force_tick(message: types.Message):
-    # admin-only
-    if not await is_user_admin(message.chat.id, message.from_user.id):
-        return await message.reply("Только админам.")
-    await run_daily_process()
-    await message.reply("Принудительный тик выполнен.")
-
-@dp.message(Command("status"))
+@dp.message(Command('status'))
 async def cmd_status(message: types.Message):
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return await message.reply('Только в группах.')
+    if not await is_admin(message.chat.id, message.from_user.id):
+        return await message.reply('Только админам.')
     data = await load_data()
     entry = data.get(str(message.chat.id), {})
-    await message.reply(f"Status: {json.dumps(entry, ensure_ascii=False, indent=2)}")
+    await message.reply(f"Status:\n{json.dumps(entry, ensure_ascii=False, indent=2)}")
 
-@dp.message(Command("groups"))
-async def cmd_groups(message: types.Message):
-    # Admin-only global list
-    if not await is_user_admin(message.chat.id, message.from_user.id):
-        return await message.reply("Только админам.")
+@dp.message(Command('debug'))
+async def cmd_debug(message: types.Message):
+    if not await is_admin(message.chat.id, message.from_user.id):
+        return await message.reply('Только админам.')
     data = await load_data()
-    keys = list(data.keys())
-    await message.reply(f"Tracked groups: {len(keys)}\n" + "\n".join(keys[:50]))
+    await message.reply(f"DATA (global): {json.dumps(data, ensure_ascii=False)[:4000]}")
 
+@dp.message(Command('force_tick'))
+async def cmd_force_tick(message: types.Message):
+    if not await is_admin(message.chat.id, message.from_user.id):
+        return await message.reply('Только админам.')
+    await run_tick_start_of_day()
+    await message.reply('Принудительный 00:01 тик выполнен.')
+
+@dp.message(Command('rename'))
+async def cmd_rename(message: types.Message):
+    if not await is_admin(message.chat.id, message.from_user.id):
+        return await message.reply('Только админам.')
+    data = await load_data()
+    entry = await ensure_chat_entry(data, message.chat.id)
+    try:
+        chat = await bot.get_chat(message.chat.id)
+        base = entry.get('original_title') or strip_streak_suffix(chat.title or '')
+        entry['original_title'] = base
+        heart = GRAY_HEART if entry.get('waiting') else (RED_HEART if entry.get('streak',0)>0 else '')
+        await set_chat_title_safe(message.chat.id, base, entry.get('streak',0), heart)
+        await save_data(data)
+        await message.reply('Название обновлено по текущему стрику.')
+    except Exception:
+        await message.reply('Не удалось обновить название.')
+
+# ===== Message handler =====
 @dp.message()
-async def handle_every_message(message: types.Message):
-    # Track only in group chats
+async def handle_message(message: types.Message):
+    # ignore private chats, channels, etc.
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return
-    # ignore service messages
-    if message.new_chat_title or message.new_chat_photo or message.left_chat_member or message.new_chat_members:
+    # ignore messages from bots (including self)
+    if message.from_user and message.from_user.is_bot:
+        # but still remove service messages from bots (they are service)
+        # service messages handled below
         return
+    # ignore service messages (title change, members, etc.)
+    if message.new_chat_title or message.new_chat_photo or message.new_chat_members or message.left_chat_member or message.pinned_message:
+        # attempt to delete service messages to hide title-change notifications
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        return
+
     data = await load_data()
     cid = str(message.chat.id)
-    entry = data.get(cid, {})
-    if not entry:
-        entry = {"streak": 0, "active_today": True, "original_title": None, "last_updated": None}
+    entry = await ensure_chat_entry(data, message.chat.id)
+
+    # if we are waiting for activity in this day, first user message increments streak
+    if entry.get('waiting'):
+        entry['streak'] = int(entry.get('streak', 0)) + 1
+        entry['waiting'] = False
+        entry['active_today'] = True
+        # update title to red heart
+        try:
+            chat = await bot.get_chat(int(cid))
+            base = entry.get('original_title') or strip_streak_suffix(chat.title or '')
+            entry['original_title'] = base
+            await set_chat_title_safe(int(cid), base, entry['streak'], RED_HEART)
+        except Exception:
+            logger.exception('Failed to update title on first activity of the day')
     else:
-        entry["active_today"] = True
+        # mark that today has activity (so at 23:59 we won't reset)
+        entry['active_today'] = True
+
     data[cid] = entry
     await save_data(data)
 
-# === Daily process ===
-async def run_daily_process():
+# ===== Scheduled jobs =====
+async def run_tick_start_of_day():
+    """Run at 00:01 in TZ: prepare waiting state and show gray heart"""
     tz = pytz.timezone(TZ)
     today = datetime.now(tz).date().isoformat()
     data = await load_data()
     changed = False
     for cid, entry in list(data.items()):
-        active = entry.get("active_today", False)
-        streak = int(entry.get("streak", 0))
-        if active:
-            streak += 1
-            entry["last_updated"] = today
-        else:
-            streak = 0
-        entry["streak"] = streak
-        entry["active_today"] = False
-        # update title if possible
+        # ensure structure
+        entry = await ensure_chat_entry(data, int(cid))
+        # do not increment here — we only set waiting state
+        entry['waiting'] = True
+        entry['active_today'] = False
+        # update title to gray heart (keep streak number)
         try:
             chat = await bot.get_chat(int(cid))
-            base = entry.get("original_title") or strip_streak_suffix(chat.title or "")
-            entry["original_title"] = base
-            new_title = f"{base} {streak}🔥" if streak > 0 else base
-            # only set title if changed
-            if (chat.title or "") != new_title:
-                await bot.set_chat_title(int(cid), new_title)
+            base = entry.get('original_title') or strip_streak_suffix(chat.title or '')
+            entry['original_title'] = base
+            await set_chat_title_safe(int(cid), base, entry.get('streak',0), GRAY_HEART if entry.get('streak',0)>0 else '')
         except Exception:
-            logger.exception("Failed to update title for %s", cid)
+            logger.exception('Failed updating title at start_of_day for %s', cid)
         data[cid] = entry
         changed = True
     if changed:
         await save_data(data)
 
+async def run_tick_end_of_day():
+    """Run at 23:59 in TZ: finalize day — if still waiting and no activity, reset streak"""
+    tz = pytz.timezone(TZ)
+    today = datetime.now(tz).date().isoformat()
+    data = await load_data()
+    changed = False
+    for cid, entry in list(data.items()):
+        entry = await ensure_chat_entry(data, int(cid))
+        # if after whole day still waiting (nobody wrote) -> reset streak and restore title
+        if entry.get('waiting') and not entry.get('active_today'):
+            entry['streak'] = 0
+            entry['waiting'] = False
+            entry['active_today'] = False
+            try:
+                chat = await bot.get_chat(int(cid))
+                base = entry.get('original_title') or strip_streak_suffix(chat.title or '')
+                entry['original_title'] = base
+                await set_chat_title_safe(int(cid), base, 0, '')
+            except Exception:
+                logger.exception('Failed restoring title at end_of_day for %s', cid)
+            data[cid] = entry
+            changed = True
+        else:
+            # clear active_today for next day if someone was active
+            entry['active_today'] = False
+            data[cid] = entry
+    if changed:
+        await save_data(data)
+
 async def on_startup():
-    # schedule job at 00:00 in TZ
-    scheduler.add_job(run_daily_process, 'cron', hour=0, minute=0)
+    # schedule jobs: 00:01 and 23:59 in TZ
+    scheduler.add_job(run_tick_start_of_day, 'cron', hour=0, minute=1)
+    scheduler.add_job(run_tick_end_of_day, 'cron', hour=23, minute=59)
     scheduler.start()
-    logger.info("Scheduler started (daily at 00:00 %s)", TZ)
+    logger.info('Scheduler started (00:01 start, 23:59 end) TZ=%s', TZ)
 
 async def main():
     await on_startup()
@@ -243,5 +318,5 @@ async def main():
     finally:
         await bot.session.close()
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     asyncio.run(main())
