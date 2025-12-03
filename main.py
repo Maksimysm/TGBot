@@ -126,7 +126,7 @@ async def cmd_set(message: types.Message):
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return await message.reply('Только в группах.')
     if not await is_admin(message.chat.id, message.from_user.id):
-        return await message.reply('Только администраторы могут использовать эту команду.')
+        return await message.reply('Соси лапу не достойный')
     parts = message.text.split()
     if len(parts) != 2 or not parts[1].isdigit():
         return await message.reply('Использование: /set <число>')
