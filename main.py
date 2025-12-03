@@ -145,7 +145,7 @@ async def cmd_set(message: types.Message):
     except Exception:
         logger.exception('Failed to set title on /set')
     await save_data(data)
-    await message.reply(f'Стрик установлен: {val}')
+    await message.reply(f'вогник: {val}')
 
 @dp.message(Command('reset'))
 async def cmd_reset(message: types.Message):
